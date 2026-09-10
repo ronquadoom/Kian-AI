@@ -202,3 +202,144 @@ describe('proxy rate limits', () => {
     expect(b.status).toBe(200);
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* Vercel entry point (req/res adapter)                                */
+/* ------------------------------------------------------------------ */
+
+type NodeHandler = (req: unknown, res: unknown) => Promise<void>;
+
+async function loadHandler(env: Record<string, string>): Promise<NodeHandler> {
+  setEnv(env);
+  vi.resetModules();
+  __resetRateLimitStore();
+  const mod = await import('../api/chat');
+  return mod.default as unknown as NodeHandler;
+}
+
+/**
+ * A stand-in for Vercel's Node request object. When `body` is set we mimic the
+ * platform helpers: the JSON is already parsed and the stream is drained, so
+ * the async iterator yields nothing.
+ */
+function nodeRequest(options: { body?: unknown; stream?: string; ip?: string }) {
+  return {
+    method: 'POST',
+    url: '/api/chat',
+    headers: {
+      'content-type': 'application/json',
+      'x-forwarded-for': options.ip ?? '203.0.113.9',
+    },
+    body: options.body,
+    async *[Symbol.asyncIterator]() {
+      if (options.stream !== undefined) yield Buffer.from(options.stream);
+    },
+  };
+}
+
+function nodeResponse() {
+  const res = {
+    statusCode: 0,
+    headers: {} as Record<string, string>,
+    body: Buffer.alloc(0),
+    flushes: 0,
+    setHeader(name: string, value: string | number | readonly string[]) {
+      res.headers[name.toLowerCase()] = String(value);
+    },
+    flushHeaders() {
+      res.flushes += 1;
+    },
+    write(chunk: Uint8Array) {
+      res.body = Buffer.concat([res.body, Buffer.from(chunk)]);
+    },
+    end(chunk?: Uint8Array) {
+      if (chunk) res.body = Buffer.concat([res.body, Buffer.from(chunk)]);
+    },
+  };
+  return res;
+}
+
+describe('vercel entry — req/res adapter', () => {
+  it('uses the body the Vercel runtime already parsed (stream drained)', async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => sseSuccess());
+    vi.stubGlobal('fetch', fetchMock);
+    const handler = await loadHandler({ GROQ_API_KEY: 'test-key' });
+
+    const res = nodeResponse();
+    await handler(nodeRequest({ body: validBody }), res);
+
+    expect(res.statusCode).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(res.body.toString('utf8')).toContain('hello');
+    const init = fetchMock.mock.calls[0][1] as { headers: Record<string, string> };
+    expect(init.headers.authorization).toBe('Bearer test-key');
+  });
+
+  it('reads the raw stream when the platform left the body unparsed', async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => sseSuccess());
+    vi.stubGlobal('fetch', fetchMock);
+    const handler = await loadHandler({ GROQ_API_KEY: 'test-key' });
+
+    const res = nodeResponse();
+    await handler(nodeRequest({ stream: JSON.stringify(validBody) }), res);
+
+    expect(res.statusCode).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(res.body.toString('utf8')).toContain('hello');
+  });
+
+  it('flushes the response head before streaming', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => sseSuccess()));
+    const handler = await loadHandler({ GROQ_API_KEY: 'test-key' });
+
+    const res = nodeResponse();
+    await handler(nodeRequest({ body: validBody }), res);
+
+    expect(res.flushes).toBe(1);
+    expect(res.headers['content-type']).toContain('text/event-stream');
+  });
+
+  it('rejects a genuinely empty body without calling a provider', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const handler = await loadHandler({ GROQ_API_KEY: 'test-key' });
+
+    const res = nodeResponse();
+    await handler(nodeRequest({}), res);
+
+    expect(res.statusCode).toBe(400);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('still validates the payload the platform parsed', async () => {
+    const handler = await loadHandler({ GROQ_API_KEY: 'test-key' });
+    const res = nodeResponse();
+
+    await handler(nodeRequest({ body: { provider: 'openai', model: 'gpt-4', payload: { messages: [] } } }), res);
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body.toString('utf8')).toContain('provider_not_allowed');
+  });
+});
+
+describe('vercel entry — malformed platform body', () => {
+  it('returns 400 (not a 500) when the runtime getter throws on bad JSON', async () => {
+    const handler = await loadHandler({ GROQ_API_KEY: 'test-key' });
+    const res = nodeResponse();
+
+    const req = {
+      method: 'POST',
+      url: '/api/chat',
+      headers: { 'content-type': 'application/json', 'x-forwarded-for': '203.0.113.9' },
+      get body(): unknown {
+        throw new SyntaxError('Unexpected token n in JSON');
+      },
+      async *[Symbol.asyncIterator]() {},
+    };
+
+    await handler(req, res);
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body.toString('utf8')).toContain('not valid JSON');
+  });
+});
