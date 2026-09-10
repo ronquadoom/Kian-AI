@@ -206,10 +206,13 @@ async function callUpstream(payload: ChatRequestPayload): Promise<Response> {
   return res;
 }
 
-/** Forward the provider response through, stripping content-length (SSE has none). */
+/**
+ * Forward the provider response through, stripping content-length (SSE has none)
+ * and hop-by-hop headers such as `connection`, which Node rewrites itself.
+ */
 function passthrough(upstream: Response): Response {
   const headers = new Headers();
-  const copy = ['content-type', 'cache-control', 'connection', 'x-accel-buffering'];
+  const copy = ['content-type', 'cache-control', 'x-accel-buffering'];
   for (const key of copy) {
     const value = upstream.headers.get(key);
     if (value) headers.set(key, value);
@@ -402,20 +405,77 @@ async function handleChatRaw(visitorKey: string, body: unknown): Promise<Respons
   return passthrough(await callUpstream(payload));
 }
 
-export async function handleChat(request: Request): Promise<Response> {
-  let body: unknown;
+/** Parse a JSON body string, enforcing the size cap. */
+function parseBodyText(text: string): { body: unknown } | { error: Response } {
+  if (text.length > MAX_BODY_CHARS) {
+    return { error: jsonError('bad_request', 'Request body exceeds 4.5 MB.', 413) };
+  }
+  if (!text) return { body: undefined };
   try {
-    const text = await request.text();
-    if (text.length > MAX_BODY_CHARS) {
-      return jsonError('bad_request', 'Request body exceeds 4.5 MB.', 413);
-    }
-    body = text ? JSON.parse(text) : undefined;
+    return { body: JSON.parse(text) as unknown };
   } catch {
-    return jsonError('bad_request', 'Request body is not valid JSON.', 400);
+    return { error: jsonError('bad_request', 'Request body is not valid JSON.', 400) };
+  }
+}
+
+function headerValue(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value.join(', ') : value;
+}
+
+/** First hop of `x-forwarded-for`, or "unknown". */
+function visitorKeyOf(forwardedFor: string | undefined): string {
+  return (forwardedFor ?? 'unknown').split(',')[0].trim() || 'unknown';
+}
+
+export async function handleChat(request: Request): Promise<Response> {
+  let text: string;
+  try {
+    text = await request.text();
+  } catch {
+    return jsonError('bad_request', 'Could not read the request body.', 400);
   }
 
-  const visitorKey = (request.headers.get('x-forwarded-for') ?? 'unknown').split(',')[0].trim();
-  return handleChatRaw(visitorKey, body);
+  const parsed = parseBodyText(text);
+  if ('error' in parsed) return parsed.error;
+  return handleChatRaw(visitorKeyOf(request.headers.get('x-forwarded-for') ?? undefined), parsed.body);
+}
+
+/**
+ * Read the request body on the Node (Vercel) entry point.
+ *
+ * IMPORTANT: Vercel's Node helpers parse the JSON body for us and drain the
+ * incoming stream, exposing the result as `req.body`. Reading the stream with
+ * `for await (const chunk of req)` in that case yields NO chunks, which makes
+ * every request look like an empty body. So `req.body` is preferred when it is
+ * present; the stream is only read when the platform left it untouched (helpers
+ * disabled via NODEJS_HELPERS=0, or another Node host).
+ */
+async function readNodeBody(req: VercelRequest): Promise<{ body: unknown } | { error: Response }> {
+  let preParsed: unknown;
+  try {
+    // Accessing `req.body` runs the platform's JSON parse, which throws on malformed input.
+    preParsed = req.body;
+  } catch {
+    return { error: jsonError('bad_request', 'Request body is not valid JSON.', 400) };
+  }
+
+  if (preParsed !== undefined && preParsed !== null) {
+    if (typeof preParsed === 'string') return parseBodyText(preParsed);
+    if (Buffer.isBuffer(preParsed)) return parseBodyText(preParsed.toString('utf8'));
+    if (typeof preParsed === 'object') return { body: preParsed };
+  }
+
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buf.length;
+    if (size > MAX_BODY_CHARS) {
+      return { error: jsonError('bad_request', 'Request body exceeds 4.5 MB.', 413) };
+    }
+    chunks.push(buf);
+  }
+  return parseBodyText(Buffer.concat(chunks).toString('utf8'));
 }
 
 /**
@@ -428,26 +488,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
     if (req.headers[h]) delete req.headers[h];
   }
 
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  const rawBody = Buffer.concat(chunks).toString('utf8');
-
-  const headers = new Headers();
-  for (const [key, value] of Object.entries(req.headers)) {
-    if (value === undefined) continue;
-    headers.set(key, Array.isArray(value) ? value.join(', ') : value);
-  }
-
-  const request = new Request(`https://kian.local${req.url ?? '/'}`, {
-    method: req.method ?? 'POST',
-    headers,
-    body: rawBody,
-  });
-
-  const response = await handleChat(request);
+  const parsed = await readNodeBody(req);
+  const response =
+    'error' in parsed
+      ? parsed.error
+      : await handleChatRaw(visitorKeyOf(headerValue(req.headers['x-forwarded-for'])), parsed.body);
 
   res.statusCode = response.status;
   for (const [key, value] of response.headers.entries()) res.setHeader(key, value);
+  // Send the response head straight away so SSE frames are not held back until
+  // the first token arrives.
+  res.flushHeaders?.();
 
   const reader = response.body?.getReader();
   if (reader) {
